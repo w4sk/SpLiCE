@@ -10,11 +10,15 @@ def main():
     parser.add_argument('-out_path', type=str)
     parser.add_argument('--verbose', action="store_true")
     parser.add_argument('-l1_penalty', type=float)
-    parser.add_argument('-device', type=str, default="cuda")
+    parser.add_argument('-device', type=str, default=None)
     parser.add_argument('-model', type=str, default="open_clip:ViT-B-32")
     parser.add_argument('-vocab', type=str, default="laion")
     parser.add_argument('-vocab_size', type=int, default=10000)
     args = parser.parse_args()
+
+    # Auto-detect device if not specified
+    if args.device is None:
+        args.device = splice.get_device()
 
     splicemodel = splice.load(args.model, args.vocab, args.vocab_size, args.device, l1_penalty = args.l1_penalty, return_weights=True)
     preprocess = splice.get_preprocess(args.model)

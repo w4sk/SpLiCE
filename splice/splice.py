@@ -5,6 +5,15 @@ import urllib
 
 GITHUB_HOST_LINK = "https://raw.githubusercontent.com/AI4LIFE-GROUP/SpLiCE/main/data/"
 
+def get_device():
+    """Get the best available device (CUDA > MPS > CPU)"""
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
 SUPPORTED_MODELS = {
     "clip": [
         "ViT-B/32",
@@ -59,7 +68,7 @@ def _download(url: str, root: str, subfolder: str):
             output.write(buffer)
     return download_target
 
-def load(name: str, vocabulary: str, vocabulary_size: int = -1, device = "cuda" if torch.cuda.is_available() else "cpu", download_root = None, **kwargs):
+def load(name: str, vocabulary: str, vocabulary_size: int = -1, device = None, download_root = None, **kwargs):
     """load SpLiCE
 
     Parameters
@@ -73,6 +82,10 @@ def load(name: str, vocabulary: str, vocabulary_size: int = -1, device = "cuda" 
     download_root : str
         path to download vocabulary and mean data to, otherwise "~/.cache/splice"
     """
+    # Set device if not specified
+    if device is None:
+        device = get_device()
+    
     if ":" not in name:
         raise RuntimeError("Please define your CLIP backbone with the syntax \'[library]:[model]\'")
 
@@ -85,7 +98,13 @@ def load(name: str, vocabulary: str, vocabulary_size: int = -1, device = "cuda" 
                 tokenizer = clip.tokenize
             elif library == "open_clip":
                 import open_clip
-                clip_backbone = open_clip.create_model(model_name, device=device, pretrained='laion2b_s34b_b79k') ##FIXME maybe allow specifying pretrained? probs not though
+                # Use create_model_and_transforms to properly load pretrained weights
+                # This handles Hugging Face downloading correctly
+                clip_backbone, _, _ = open_clip.create_model_and_transforms(
+                    model_name, 
+                    pretrained='laion2b_s34b_b79k'
+                )
+                clip_backbone = clip_backbone.to(device)
                 tokenizer = open_clip.get_tokenizer(model_name)
             else:
                 raise RuntimeError("Only CLIP and Open CLIP supported at this time. Try manual construction instead.")
@@ -94,7 +113,47 @@ def load(name: str, vocabulary: str, vocabulary_size: int = -1, device = "cuda" 
     else:
         raise RuntimeError(f"Library {name} not supported. Try manual construction instead.")
     
-    if vocabulary in SUPPORTED_VOCAB:
+    
+    # Check for custom local vocabulary first
+    # __file__ is in SpLiCE/splice/, so go up one level to SpLiCE/
+    local_vocab_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "vocab", vocabulary + ".txt")
+    
+    if os.path.exists(local_vocab_path):
+        # Load custom local vocabulary
+        concepts = []
+        vocab = []
+        vocab_path = local_vocab_path
+
+        concept_root = download_root or os.path.expanduser("~/.cache/splice/")
+        os.makedirs(os.path.join(concept_root, "embeddings"), exist_ok=True)
+
+        if vocabulary_size <= 0:
+            vocabulary_size_name = "full"
+        else:
+            vocabulary_size_name = vocabulary_size
+        concept_path = os.path.join(concept_root, f"embeddings/{name}_{vocabulary}_{vocabulary_size_name}_embeddings.pt")
+
+        if os.path.isfile(concept_path):
+            concepts = torch.load(concept_path, map_location=torch.device(device))
+        else:
+            with open(vocab_path, "r") as f:
+                lines = f.readlines()
+                if vocabulary_size > 0 and vocabulary_size < len(lines):
+                    lines = lines[:vocabulary_size]  # Use first N for custom vocab
+                for line in lines:
+                    line = line.strip()
+                    if not line:  # Skip empty lines
+                        continue
+                    vocab.append(line)
+                    tokens = tokenizer(line).to(device)
+                    with torch.no_grad():
+                        concept_embedding = clip_backbone.encode_text(tokens)
+                    concepts.append(concept_embedding)
+            
+            concepts = torch.nn.functional.normalize(torch.stack(concepts).squeeze(), dim=1)
+            concepts = torch.nn.functional.normalize(concepts-torch.mean(concepts, dim=0), dim=1)
+            torch.save(concepts, concept_path)
+    elif vocabulary in SUPPORTED_VOCAB:
         concepts = []
         vocab = []
 
@@ -128,7 +187,7 @@ def load(name: str, vocabulary: str, vocabulary_size: int = -1, device = "cuda" 
             concepts = torch.nn.functional.normalize(concepts-torch.mean(concepts, dim=0), dim=1)
             torch.save(concepts, concept_path)
     else:
-        raise RuntimeError(f"Vocabulary {vocabulary} not supported.")
+        raise RuntimeError(f"Vocabulary {vocabulary} not supported and not found in local data/vocab/ directory.")
     
     
     model_path = model_name.replace("/","-")
@@ -161,19 +220,31 @@ def get_vocabulary(name: str, vocabulary_size: int, download_root = None):
     _type_
         _description_
     """
-    if name in SUPPORTED_VOCAB:
+    # Check for custom local vocabulary first
+    # __file__ is in SpLiCE/splice/, so go up one level to SpLiCE/
+    local_vocab_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "vocab", name + ".txt")
+    
+    if os.path.exists(local_vocab_path):
+        vocab_path = local_vocab_path
+    elif name in SUPPORTED_VOCAB:
         vocab_path = _download(os.path.join(GITHUB_HOST_LINK, "vocab", name + ".txt"), download_root or os.path.expanduser("~/.cache/splice/"), "vocab")
-
-        vocab = []
-        with open(vocab_path, "r") as f:
-            lines = f.readlines()
-            if vocabulary_size > 0:
-                lines = lines[-vocabulary_size:]
-            for line in lines:
-                vocab.append(line.strip())
-        return vocab
     else:
-        raise RuntimeError(f"Vocabulary {name} not supported.")
+        raise RuntimeError(f"Vocabulary {name} not supported and not found in local data/vocab/ directory.")
+
+    vocab = []
+    with open(vocab_path, "r") as f:
+        lines = f.readlines()
+        if vocabulary_size > 0 and vocabulary_size < len(lines):
+            # For custom vocab, use first N; for supported vocab, use last N (frequency-based)
+            if os.path.exists(local_vocab_path):
+                lines = lines[:vocabulary_size]
+            else:
+                lines = lines[-vocabulary_size:]
+        for line in lines:
+            line_stripped = line.strip()
+            if line_stripped:  # Skip empty lines
+                vocab.append(line_stripped)
+    return vocab
 
 def get_tokenizer(name: str):
     """get_tokenizer Gets tokenizer for SpLiCE model
@@ -231,7 +302,7 @@ def get_preprocess(name: str):
                 return clip.load(model_name)[1]
             elif library == "open_clip":
                 import open_clip
-                return open_clip.create_model_and_transforms(model_name)[2]
+                return open_clip.create_model_and_transforms(model_name, pretrained='laion2b_s34b_b79k')[2]
             else:
                 raise RuntimeError("Only CLIP and Open CLIP supported at this time. Try manual construction instead.")
         else:
